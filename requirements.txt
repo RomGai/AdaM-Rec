@@ -1,0 +1,12 @@
+# Dependencies used by run_pipe and agent; this is not a tested environment lockfile.
+# Install torch/torchvision builds appropriate for the execution machine.
+# transformers must support Qwen3.5 generation and the existing Qwen3-VL embedding APIs.
+numpy
+pandas
+torch
+torchvision
+transformers>=5.3.0,<6
+sentence-transformers
+qwen-vl-utils
+Pillow
+accelerate
