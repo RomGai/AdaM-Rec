@@ -1040,7 +1040,7 @@ def _print_dynamic_output_metrics(output_dir: str | Path, top_ns: List[int] | Tu
             f"@{top_k} HitRate/Recall={recall:.6f} NDCG={ndcg:.6f} MRR={mrr:.6f}"
         )
 
-    print(f"[Metrics][Aggregated] files={files_count} " + " | ".join(metric_chunks))
+    print(f"[Metrics][Aggregated] files={files_count} " + " | ".join(metric_chunks), flush=True)
 
 
 def _write_recall_failed_zero_output(output_path: Path, user_id: str, query: str, target_id: str) -> None:
@@ -1245,6 +1245,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 "top1": _safe_item_id(saved["ranked_items"][0]),
             })
             skipped_rows += 1
+            _print_dynamic_output_metrics(args.output_dir)
             continue
         routed = _route_query(query, category_catalog, args.enable_llm_routing, args.backbone)
 
@@ -1275,6 +1276,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                         "used_k": 0,
                     }
                 )
+                _print_dynamic_output_metrics(args.output_dir)
                 continue
 
         filtered_idx = [item_id_to_index[iid] for iid in filtered_item_ids]
@@ -1374,6 +1376,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 recall_hit=0,
             )
             results.append({"user_id": user_id, "target_id": target_id, "hit": 0, "used_k": used_k})
+            _print_dynamic_output_metrics(args.output_dir)
             continue
 
         if bool(getattr(args, "recall_only", False)):
@@ -1386,6 +1389,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 recall_hit=1,
             )
             results.append({"user_id": user_id, "target_id": target_id, "hit": 1, "used_k": used_k})
+            _print_dynamic_output_metrics(args.output_dir)
             continue
 
         candidate_items: List[Dict[str, Any]] = []
@@ -1473,6 +1477,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             "used_k": used_k,
             "top1": ranked_first,
         })
+        _print_dynamic_output_metrics(args.output_dir)
 
     _save_json(text_cache_path, {"items": item_sentence_cache})
     _save_json(Path(args.output_dir) / "unified_eval_results.json", results)
