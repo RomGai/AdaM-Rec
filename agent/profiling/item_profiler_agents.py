@@ -1,16 +1,16 @@
-"""Text/VL item profiling prompts, generation and SQLite caches for run_pipe."""
+"""Text/VL profiling prompts, concurrent generation and SQLite caches for run_pipe."""
 
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
-from agent.models.qwen35_backbone import load_backbone
+from agent.profiling.vllm_item_profiler import VLLMItemProfiler
 
 
 BehaviorLabel = Literal["positive", "negative"]
@@ -43,216 +43,6 @@ def _normalize_timestamp_for_db(ts: Optional[int]) -> int:
     if ts is None:
         return -1
     return int(ts)
-
-
-class QwenItemProfiler:
-    """Generate text or text/image profiles with the shared Qwen3.5 backbone."""
-
-    def __init__(
-        self,
-        model_name: str = "Qwen/Qwen3.5-9B",
-        device: str = "cuda",
-        torch_dtype: str = "auto",
-        max_new_tokens: Optional[int] = None,
-    ) -> None:
-        self.model_name = model_name
-        self.max_new_tokens = max_new_tokens or int(os.getenv("out_seq_length", "16384"))
-        self.device = device
-        self.torch_dtype = torch_dtype
-        self.do_sample = os.getenv("greedy", "false").lower() != "true"
-        self.top_p = float(os.getenv("top_p", "0.8"))
-        self.top_k = int(os.getenv("top_k", "20"))
-        self.temperature = float(os.getenv("temperature", "0.7"))
-        self.repetition_penalty = float(os.getenv("repetition_penalty", "1.0"))
-        self.json_retry = int(os.getenv("json_retry", "1"))
-        self._model = None
-        self._processor = None
-
-    def load(self) -> None:
-        if self._model is None:
-            self._model, self._processor = load_backbone(
-                self.model_name, self.torch_dtype,
-                "auto" if self.device == "cuda" else self.device,
-            )
-
-    def _generate_text(self, messages: List[Dict[str, Any]], force_greedy: bool = False) -> str:
-        inputs = self._processor.apply_chat_template(
-            messages,
-            tokenize=True,
-            enable_thinking=False,
-            add_generation_prompt=True,
-            return_dict=True,
-            return_tensors="pt",
-        )
-        inputs = inputs.to(self._model.device)
-
-        generate_kwargs = {
-            "max_new_tokens": self.max_new_tokens,
-            "do_sample": False if force_greedy else self.do_sample,
-            "top_p": self.top_p,
-            "top_k": self.top_k,
-            "temperature": 0.0 if force_greedy else self.temperature,
-            "repetition_penalty": self.repetition_penalty,
-        }
-        if force_greedy:
-            generate_kwargs.pop("top_p", None)
-            generate_kwargs.pop("top_k", None)
-
-        output_ids = self._model.generate(**inputs, **generate_kwargs)
-
-        generated_ids = [
-            out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, output_ids)
-        ]
-        generated_text = self._processor.batch_decode(
-            generated_ids,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        )[0]
-        return generated_text
-
-    @staticmethod
-    def _try_json_decode(text: str) -> Optional[Dict[str, Any]]:
-        decoder = json.JSONDecoder()
-        stripped = text.strip()
-
-        # 1) direct decode
-        try:
-            payload = json.loads(stripped)
-            if isinstance(payload, dict):
-                return payload
-        except json.JSONDecodeError:
-            pass
-
-        # 2) markdown json code fence
-        if "```" in stripped:
-            parts = stripped.split("```")
-            for part in parts:
-                candidate = part.replace("json", "", 1).strip()
-                if not candidate:
-                    continue
-                try:
-                    payload = json.loads(candidate)
-                    if isinstance(payload, dict):
-                        return payload
-                except json.JSONDecodeError:
-                    continue
-
-        # 3) find first decodable JSON object from any '{' start
-        for i, ch in enumerate(stripped):
-            if ch != "{":
-                continue
-            try:
-                payload, _end = decoder.raw_decode(stripped, i)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(payload, dict):
-                return payload
-
-        return None
-
-
-
-    @staticmethod
-    def _normalize_image_paths(image_paths: List[str]) -> List[str]:
-        """Drop empty/obviously invalid image entries before processor ingestion."""
-        cleaned: List[str] = []
-        for p in image_paths:
-            cand = str(p or "").strip()
-            if not cand:
-                continue
-            # Avoid placeholders that are known to break image loading.
-            if cand in {".", "./", "..", "../"}:
-                continue
-            cleaned.append(cand)
-        return cleaned
-
-    def extract(
-        self,
-        prompt: str,
-        image_paths: List[str],
-        text_only_prompt: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        self.load()
-
-        valid_image_paths = self._normalize_image_paths(image_paths)
-        image_messages = [{"type": "image", "image": path} for path in valid_image_paths]
-        if not image_messages and text_only_prompt is not None:
-            prompt = text_only_prompt
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    *image_messages,
-                    {"type": "text", "text": prompt},
-                ],
-            }
-        ]
-
-        try:
-            generated_text = self._generate_text(messages)
-        except Exception as exc:
-            if not image_messages:
-                raise
-            # Some rows contain invalid image URLs/paths; fallback to text-only profiling.
-            print(f"[QwenItemProfiler] image loading failed, fallback to text-only: {exc}")
-            image_messages = []
-            if text_only_prompt is not None:
-                prompt = text_only_prompt
-            messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
-            generated_text = self._generate_text(messages)
-
-        parsed = self._try_json_decode(generated_text)
-        if parsed is not None:
-            if not image_messages and text_only_prompt is not None:
-                parsed["visual_tags"] = {}
-            return parsed
-
-        # Retry with stricter formatting instruction to reduce JSON parsing failures.
-        for retry_idx in range(self.json_retry):
-            strict_messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        *image_messages,
-                        {
-                            "type": "text",
-                            "text": (
-                                prompt
-                                + "\n\nIMPORTANT: Output exactly one valid JSON object only. "
-                                + "Do not include markdown/code fences/comments/trailing text."
-                            ),
-                        },
-                    ],
-                }
-            ]
-            if not image_messages:
-                strict_messages = [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": (
-                                    prompt
-                                    + "\n\nIMPORTANT: Output exactly one valid JSON object only. "
-                                    + "Do not include markdown/code fences/comments/trailing text."
-                                ),
-                            }
-                        ],
-                    }
-                ]
-            generated_text = self._generate_text(strict_messages, force_greedy=True)
-            parsed = self._try_json_decode(generated_text)
-            if parsed is not None:
-                if not image_messages and text_only_prompt is not None:
-                    parsed["visual_tags"] = {}
-                return parsed
-
-        raise ValueError(
-            "Model output is not valid JSON after retries. "
-            f"Last output (truncated): {generated_text[:2000]}"
-        )
-
 
 
 class GlobalItemDB:
@@ -503,30 +293,86 @@ def build_profile_prompt(item: ItemProfileInput, use_vl: bool = True) -> str:
     return build_vl_profile_prompt(item) if use_vl else build_text_profile_prompt(item)
 
 
-def get_or_create_item_profile(
-    extractor: QwenItemProfiler,
+def get_or_create_item_profiles(
+    extractor: VLLMItemProfiler,
     global_db: GlobalItemDB,
-    item: ItemProfileInput,
+    items: List[ItemProfileInput],
     use_vl: bool,
-) -> Dict[str, Any]:
-    """Reuse only profiles generated with the same prompt version, mode and backbone."""
+    concurrency: int = 1,
+    progress=None,
+) -> List[Dict[str, Any]]:
+    """Generate cache misses concurrently; keep SQLite writes on the caller thread."""
+    if concurrency < 1:
+        raise ValueError("profile concurrency must be positive")
     generation = {
         "prompt_version": "english_split_v1",
         "mode": "vl" if use_vl else "text",
         "model": extractor.model_name,
     }
-    cached = global_db.get_profile(item.item_id)
-    if cached is not None and cached.get("_profile_generation") == generation:
-        return cached
+    profiles = {}
+    missing = {}
+    for item in items:
+        if item.item_id in profiles or item.item_id in missing:
+            continue
+        cached = global_db.get_profile(item.item_id)
+        if cached is not None and cached.get("_profile_generation") == generation:
+            profiles[item.item_id] = cached
+        else:
+            missing[item.item_id] = item
+    cached_count = len(profiles)
+    total = cached_count + len(missing)
+    if progress:
+        progress(len(profiles), total, cached_count)
 
-    image_paths = [item.main_image, *item.detail_images] if use_vl else []
-    profile = extractor.extract(
-        prompt=build_profile_prompt(item, use_vl=use_vl),
-        image_paths=image_paths,
-        text_only_prompt=build_text_profile_prompt(item),
-    )
-    if not use_vl:
-        profile["visual_tags"] = {}
-    profile["_profile_generation"] = generation
-    global_db.upsert(item.item_id, profile)
-    return profile
+    def generate(item):
+        profile = extractor.extract(
+            prompt=build_profile_prompt(item, use_vl=use_vl),
+            image_paths=[item.main_image, *item.detail_images] if use_vl else [],
+            text_only_prompt=build_text_profile_prompt(item),
+        )
+        if not use_vl:
+            profile["visual_tags"] = {}
+        profile["_profile_generation"] = generation
+        return profile
+
+    def save(item, profile):
+        global_db.upsert(item.item_id, profile)
+        profiles[item.item_id] = profile
+        if progress:
+            progress(len(profiles), total, cached_count)
+
+    if concurrency == 1:
+        for item in missing.values():
+            save(item, generate(item))
+    elif missing:
+        remaining = iter(missing.values())
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            pending = {}
+
+            def submit_next():
+                item = next(remaining, None)
+                if item is not None:
+                    pending[executor.submit(generate, item)] = item
+
+            for _ in range(min(concurrency, len(missing))):
+                submit_next()
+            while pending:
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                failures = []
+                for future in done:
+                    item = pending.pop(future)
+                    try:
+                        save(item, future.result())
+                    except Exception as exc:
+                        failures.append(exc)
+                if failures:
+                    # Preserve already-running successes before reporting the failure.
+                    for future, item in pending.items():
+                        try:
+                            save(item, future.result())
+                        except Exception:
+                            pass
+                    raise failures[0]
+                for _ in done:
+                    submit_next()
+    return [profiles[item.item_id] for item in items]
