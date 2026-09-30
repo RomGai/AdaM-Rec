@@ -12,7 +12,6 @@ import glob
 import json
 import math
 import re
-import time
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -31,10 +30,10 @@ from agent.profiling.item_profiler_agents import (
     GlobalItemDB,
     HistoryItemProfileInput,
     ItemProfileInput,
+    QwenItemProfiler,
     UserHistoryLogDB,
-    get_or_create_item_profiles,
+    get_or_create_item_profile,
 )
-from agent.profiling.vllm_item_profiler import VLLMItemProfiler
 from agent.retrieval.intent_dual_recall_agent import QwenRouterLLM
 from agent.retrieval.pseudo_query_recall import PseudoQueryDualRetriever
 
@@ -1095,41 +1094,12 @@ def _has_non_empty_ranked_items(output_path: Path) -> bool:
     return isinstance(ranked_items, list) and len(ranked_items) > 0
 
 
-def _profile_progress(label):
-    started = time.monotonic()
-    last_print = started
-
-    def report(completed, total, cached):
-        nonlocal last_print
-        now = time.monotonic()
-        if completed == cached or completed == total or now - last_print >= 15:
-            print(
-                f"[{label}] {completed}/{total} cached={cached} "
-                f"generated={completed - cached} elapsed={now - started:.1f}s",
-                flush=True,
-            )
-            last_print = now
-
-    return report
-
-
 def run(args: argparse.Namespace) -> Dict[str, Any]:
     apply_dataset_defaults(args)
     resolve_dataset_paths(args)
     data_status = ensure_dataset_data(args)
     if getattr(args, "prepare_data_only", False):
         return {"dataset": args.dataset, "data_preparation": data_status}
-    profile_concurrency = args.profile_concurrency
-    if args.profile_concurrency < 1:
-        raise ValueError("--profile-concurrency must be positive")
-    if args.profile_max_new_tokens is not None and args.profile_max_new_tokens < 1:
-        raise ValueError("--profile-max-new-tokens must be positive")
-    profile_extractor = VLLMItemProfiler(
-        model_name=args.backbone, base_url=args.vllm_base_url,
-        timeout=args.vllm_timeout, max_new_tokens=args.profile_max_new_tokens,
-    )
-    if not args.recall_only:
-        profile_extractor.check_connection()
     print(f"[Preset] dataset={args.dataset} recall_control={'llm' if args.agent3_adaptive_llm_recall_control else 'rule'} "
           f"budget={args.agent3_adaptive_min_total_recall}-{args.agent3_adaptive_max_total_recall} "
           f"pool={args.agent3_query_recall_pool} vl_chunk={args.agent3_qwen3vl_chunk_size}")
@@ -1180,7 +1150,6 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     item_emb_norm = _l2_normalize(item_emb_matrix)
     qwen3vl_model = None
     qwen3vl_item_emb_norm: np.ndarray | None = None
-    image_url_to_local = {}
     if args.enable_agent3_qwen3vl_embedding:
         from agent.models.qwen3_vl_embedding import Qwen3VLEmbedder
         print(f"[Init] load multimodal embedding model: {args.agent3_qwen3vl_model}")
@@ -1250,6 +1219,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         )
     global_db = GlobalItemDB(args.global_db)
     history_db = UserHistoryLogDB(args.history_db)
+    profile_extractor = QwenItemProfiler(model_name=args.backbone)
 
     category_catalog = sorted({_meta_category_text(v) for v in meta_map.values() if _meta_category_text(v)})
     results: List[Dict[str, Any]] = []
@@ -1422,8 +1392,8 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             _print_dynamic_output_metrics(args.output_dir)
             continue
 
-        candidate_inputs = []
-        for iid in top_ids:
+        candidate_items: List[Dict[str, Any]] = []
+        for i, iid in enumerate(top_ids, start=1):
             meta = meta_map[iid]
             item_input = ItemProfileInput(
                 item_id=iid,
@@ -1435,20 +1405,16 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 price=str(meta.get("price", "") or ""),
                 category_hint=_meta_category_text(meta),
             )
-            item_input.main_image = image_url_to_local.get(item_input.main_image, item_input.main_image)
-            candidate_inputs.append(item_input)
-        candidate_profiles = get_or_create_item_profiles(
-            profile_extractor, global_db, candidate_inputs, use_vl=args.enable_vl_profiling,
-            concurrency=profile_concurrency, progress=_profile_progress("Agent1"),
-        )
-        candidate_items = [
-            {"item_id": item.item_id, "profile": profile}
-            for item, profile in zip(candidate_inputs, candidate_profiles)
-        ]
+            profile = get_or_create_item_profile(
+                profile_extractor, global_db, item_input, use_vl=args.enable_vl_profiling
+            )
+
+            candidate_items.append({"item_id": iid, "profile": profile})
+            if i % 50 == 0 or i == len(top_ids):
+                print(f"[Agent1] {i}/{len(top_ids)}")
 
         history_rows: List[Dict[str, Any]] = []
-        history_inputs = []
-        for iid in history_ids:
+        for i, iid in enumerate(history_ids, start=1):
             meta = meta_map.get(iid)
             if meta is None:
                 continue
@@ -1465,18 +1431,16 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 price=str(meta.get("price", "") or ""),
                 category_hint=_meta_category_text(meta),
             )
-            item_input.main_image = image_url_to_local.get(item_input.main_image, item_input.main_image)
-            history_inputs.append(item_input)
-        history_profiles = get_or_create_item_profiles(
-            profile_extractor, global_db, history_inputs, use_vl=args.enable_vl_profiling,
-            concurrency=profile_concurrency, progress=_profile_progress("Agent2"),
-        )
-        for item_input, profile in zip(history_inputs, history_profiles):
-            iid = item_input.item_id
+            profile = get_or_create_item_profile(
+                profile_extractor, global_db, item_input, use_vl=args.enable_vl_profiling
+            )
+
             if not history_db.exists(user_id=user_id, item_id=iid, behavior="positive", timestamp=None):
                 history_db.insert(user_id=user_id, item_id=iid, behavior="positive", timestamp=None, profile=profile)
 
             history_rows.append({"user_id": user_id, "item_id": iid, "behavior": "positive", "timestamp": None, "profile": profile})
+            if i % 20 == 0 or i == len(history_ids):
+                print(f"[Agent2] {i}/{len(history_ids)}")
         agent3_output = {
             "query": q_sentence,
             "user_id": user_id,
@@ -1578,10 +1542,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--enable-llm-routing", action=argparse.BooleanOptionalAction, default=None, help="开启LLM文本路由（默认开启）；关闭时走规则fallback")
     parser.add_argument("--enable-vl-profiling", action="store_true", help="使用文本和图片生成画像；默认使用纯文本 prompt 调用 backbone 生成画像")
-    parser.add_argument("--profile-concurrency", type=int, default=16, help="商品画像请求并发数，默认 16")
-    parser.add_argument("--profile-max-new-tokens", type=int, default=None, help="画像输出上限；默认沿用 out_seq_length 环境变量或 16384")
-    parser.add_argument("--vllm-base-url", default="http://127.0.0.1:8000/v1", help="画像服务的 OpenAI-compatible API 地址")
-    parser.add_argument("--vllm-timeout", type=float, default=600, help="单次 vLLM 请求超时秒数")
     parser.add_argument("--disable-agent45", action="store_true", help="关闭Agent4/5")
     parser.add_argument("--recall-only", action="store_true", help="仅执行Agent3召回并输出召回Top-K，不运行Agent1/2/4/5。")
     parser.add_argument("--enable-collaborative-signal", action=argparse.BooleanOptionalAction, default=None, help="开启Agent4协同信号：基于Reasoning embedding检索相似用户并扩充Agent5候选池")

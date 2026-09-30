@@ -29,33 +29,15 @@ Metadata is downloaded and prepared as needed; local files are reused.
 
 # Inference and Evaluation
 
-**Start the profiling server:**
-
-In a separate Linux environment, install vLLM and start the server. This is a starting configuration for one A100 80GB:
-
-```bash
-python -m pip install "vllm>=0.17.0"
-CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen3.5-9B \
-  --tensor-parallel-size 1 \
-  --gpu-memory-utilization 0.45 \
-  --max-model-len 32768 \
-  --max-num-seqs 16 \
-  --reasoning-parser qwen3
-```
-
-Agent 1/2 use vLLM; routing, preference inference, and logits-based ranking use the local Transformers backbone. Both backbone instances occupy GPU memory; the server configuration above leaves room for the pipeline's other models. Adjust memory allocation and concurrency to fit your workload.
+Run the following commands from the repository root.
 
 **Run the pipeline:**
-
-From the repository root in the pipeline environment:
 
 ```bash
 python run_pipe.py --dataset beauty
 python run_pipe.py --dataset clothing
 python run_pipe.py --dataset music
 ```
-
-Profiling uses 16 concurrent requests and reuses cached profiles. Set `--profile-concurrency` to adjust concurrency or `--vllm-base-url` to change the default server address (`http://127.0.0.1:8000/v1`). Authenticated servers read the client key from `VLLM_API_KEY`.
 
 **Enable visual item profiling:**
 
