@@ -1,4 +1,4 @@
-# AdaM-Rec: Adaptive Modality Routing for Multimodal Recommendation
+# AdaM-Rec: Adaptive Modality Routing for Multimodal Recommendation [[Link to paper](https://arxiv.org/pdf/2609.38455)]
 
 ![Framework](Figure/framework.png)
 
